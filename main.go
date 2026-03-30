@@ -18,7 +18,8 @@ import (
 )
 
 const (
-	sampleRate = 44100
+	sampleRate  = 44100
+	uiBarHeight = 60
 )
 
 type Dictionary map[string]string
@@ -26,9 +27,10 @@ type Dictionary map[string]string
 var translations = map[string]Dictionary{
 	"en": {"win": "SYNERGY REACHED", "exit": "EXIT", "lvl": "LEVEL", "best": "SCORES", "lang": "LANG: EN", "combo": "COMBO", "streak": "STREAK", "over": "GAME OVER"},
 	"es": {"win": "SINERGIA ALCANZADA", "exit": "SALIR", "lvl": "NIVEL", "best": "RECORDS", "lang": "IDIO: ES", "combo": "COMBO", "streak": "RACHA", "over": "JUEGO TERMINADO"},
+	"fr": {"win": "SYNERGIE ATTEINTE", "exit": "QUITTER", "lvl": "NIVEAU", "best": "SCORES", "lang": "LANG: FR", "combo": "COMBO", "streak": "SERIE", "over": "PARTIE TERMINEE"},
 	"ru": {"win": "SINERGIYA DOSTIGNUTA", "exit": "VYKHOD", "lvl": "UROVEN", "best": "REKORDY", "lang": "YAZYK: RU", "combo": "KOMBO", "streak": "SERIYA", "over": "KONETS IGRY"},
 }
-var langOrder = []string{"es", "en", "ru"}
+var langOrder = []string{"en", "es", "fr", "ru"}
 
 type Zone struct {
 	x, y, vx, vy float64
@@ -51,7 +53,6 @@ type serverScore struct {
 	Level int    `json:"level"`
 }
 
-// HTTP helpers using synchronous XHR (same-origin, localhost)
 func httpGetJSON(url string) string {
 	xhr := js.Global().Get("XMLHttpRequest").New()
 	xhr.Call("open", "GET", url, false)
@@ -73,7 +74,6 @@ func httpPostJSON(url, body string) string {
 	return ""
 }
 
-// --- Kage Shader (Neon Aesthetic) ---
 var shaderSource = []byte(`
 //kage:unit pixels
 package main
@@ -125,7 +125,7 @@ type Game struct {
 	particles        []*Particle
 	audioCtx         *audio.Context
 	audioStarted     bool
-	music            *musicalEngine
+	music            *voiceEngine
 	player           *audio.Player
 	scores           []ScoreEntry
 	isTouching       bool
@@ -141,6 +141,7 @@ type Game struct {
 	timeLeft         float64
 	gameOver         bool
 	playerName       string
+	gameStarted      bool
 }
 
 func levelDuration(level int) float64 {
@@ -159,9 +160,19 @@ func (g *Game) Update() error {
 		g.initAudio()
 	}
 
-	// Wait for Draw to set screen dimensions and initialize zones
 	if g.screenWidth == 0 {
 		return nil
+	}
+
+	// Update finger position early so header/play-area detection is current this frame
+	if g.isTouching {
+		if len(touchIDs) > 0 {
+			cx, cy := ebiten.TouchPosition(touchIDs[0])
+			g.fingerX, g.fingerY = float64(cx), float64(cy)
+		} else {
+			cx, cy := ebiten.CursorPosition()
+			g.fingerX, g.fingerY = float64(cx), float64(cy)
+		}
 	}
 
 	justTouched := false
@@ -179,29 +190,45 @@ func (g *Game) Update() error {
 
 	if justTouched {
 		// EXIT always works
-		if tx > g.screenWidth-100 && ty < 60 {
+		if tx > g.screenWidth-100 && ty < uiBarHeight {
 			js.Global().Get("window").Get("location").Call("reload")
 		}
-		// Tap anywhere (except EXIT) restarts after game over
+		// Retry after game over
 		if g.gameOver {
 			g.resetGame()
 			return nil
 		}
-		if tx < 100 && ty < 60 {
+		// Language cycle (works on intro and in-game)
+		if tx < 100 && ty < uiBarHeight {
 			g.nextLang()
 		}
-		if tx > 110 && tx < 160 && ty < 60 {
-			g.showLeaderboard = !g.showLeaderboard
+		if g.gameStarted {
+			// Scores toggle
+			if tx > 110 && tx < 160 && ty < uiBarHeight {
+				g.showLeaderboard = !g.showLeaderboard
+			}
+			// NAME button: immediately prompt for new name
+			if tx > 170 && tx < 230 && ty < uiBarHeight {
+				js.Global().Get("localStorage").Call("removeItem", "cyber_player_name")
+				g.playerName = g.getPlayerName()
+			}
 		}
-		if tx > 170 && tx < 230 && ty < 60 {
-			js.Global().Get("localStorage").Call("removeItem", "cyber_player_name")
-			g.playerName = ""
+		// Tap play area to start (intro screen)
+		if !g.gameStarted && ty >= uiBarHeight {
+			if g.playerName == "" {
+				g.playerName = g.getPlayerName()
+				// Don't start yet — show name on intro, next tap starts
+			} else {
+				g.gameStarted = true
+			}
 		}
 	}
 
+	// Audio only when touching play area (not header) or during win
+	touchingPlay := g.isTouching && g.fingerY >= uiBarHeight
 	if g.player != nil {
 		vol := 0.0
-		if g.isTouching || g.win {
+		if touchingPlay || g.win {
 			vol = g.syncLevel
 			if g.win {
 				vol = 1.0
@@ -222,13 +249,17 @@ func (g *Game) Update() error {
 		if g.winTime == 1 {
 			g.saveScore()
 		}
-		if g.winTime > 450 {
+		if g.winTime > 112 {
 			g.nextLevel()
 		}
 		return nil
 	}
 
-	// Timer countdown — lose when it hits zero
+	// Freeze game logic until player starts
+	if !g.gameStarted {
+		return nil
+	}
+
 	g.timeLeft -= 1.0 / 60.0
 	if g.timeLeft <= 0 {
 		g.timeLeft = 0
@@ -242,58 +273,54 @@ func (g *Game) Update() error {
 	g.currentZonePower = 0.0
 	g.fingerSpeed = 0
 	if g.isTouching {
-		var curX, curY int
-		if len(touchIDs) > 0 {
-			curX, curY = ebiten.TouchPosition(touchIDs[0])
+		if g.fingerY < uiBarHeight {
+			// Header touch — no gameplay, reset movement tracking
+			g.lastX, g.lastY = 0, 0
 		} else {
-			curX, curY = ebiten.CursorPosition()
-		}
-		g.fingerX, g.fingerY = float64(curX), float64(curY)
-
-		for i := range g.zones {
-			z := &g.zones[i]
-			dist := math.Sqrt(math.Pow(g.fingerX-z.x, 2) + math.Pow(g.fingerY-z.y, 2))
-			if dist < z.radius {
-				g.currentZonePower = z.power
-				js.Global().Get("window").Get("navigator").Call("vibrate", 10)
-				g.spawnParticles(g.fingerX, g.fingerY, 1)
-				break
-			}
-		}
-
-		if g.lastX != 0 || g.lastY != 0 {
-			dx, dy := g.fingerX-float64(g.lastX), g.fingerY-float64(g.lastY)
-			distMoved := math.Sqrt(dx*dx + dy*dy)
-			g.fingerSpeed = distMoved
-			if distMoved > 1.0 {
-				mul := 1.0
-				if g.currentZonePower != 0 {
-					mul = math.Abs(g.currentZonePower)
+			for i := range g.zones {
+				z := &g.zones[i]
+				dist := math.Sqrt(math.Pow(g.fingerX-z.x, 2) + math.Pow(g.fingerY-z.y, 2))
+				if dist < z.radius {
+					g.currentZonePower = z.power
+					js.Global().Get("window").Get("navigator").Call("vibrate", 10)
+					g.spawnParticles(g.fingerX, g.fingerY, 1)
+					break
 				}
-				if g.currentZonePower < 0 {
-					friction = -distMoved * 0.0006 // stronger interference drain
-					if g.comboCount > 0 {
-						g.comboCount -= 4
+			}
+
+			if g.lastX != 0 || g.lastY != 0 {
+				dx, dy := g.fingerX-float64(g.lastX), g.fingerY-float64(g.lastY)
+				distMoved := math.Sqrt(dx*dx + dy*dy)
+				g.fingerSpeed = distMoved
+				if distMoved > 1.0 {
+					mul := 1.0
+					if g.currentZonePower != 0 {
+						mul = math.Abs(g.currentZonePower)
+					}
+					if g.currentZonePower < 0 {
+						friction = -distMoved * 0.0006
+						if g.comboCount > 0 {
+							g.comboCount -= 4
+						}
+					} else {
+						comboMul := 1.0 + float64(g.comboCount)/60.0
+						friction = distMoved * 0.00012 * mul * comboMul
+						if g.comboCount < 60 {
+							g.comboCount++
+						}
 					}
 				} else {
-					comboMul := 1.0 + float64(g.comboCount)/60.0 // up to 2x at max combo
-					friction = distMoved * 0.00012 * mul * comboMul
-					if g.comboCount < 60 {
-						g.comboCount++
-					}
+					// Still — must keep moving or sync drains
+					friction = -(0.001 + g.syncLevel*0.004)
 				}
-			} else {
-				// Finger is still — must keep moving or sync drains
-				friction = -(0.001 + g.syncLevel*0.004)
 			}
+			g.lastX, g.lastY = int(g.fingerX), int(g.fingerY)
 		}
-		g.lastX, g.lastY = int(g.fingerX), int(g.fingerY)
 	} else {
 		g.lastX, g.lastY = 0, 0
 		if g.comboCount > 0 {
 			g.comboCount -= 2
 		}
-		// Progressive drain: gentle when low, punishing when near goal
 		drain := 0.025 + g.syncLevel*0.07
 		g.syncLevel -= drain
 	}
@@ -307,7 +334,6 @@ func (g *Game) Update() error {
 		g.win = true
 	}
 
-	// Milestone celebrations at 25%, 50%, 75%
 	if g.milestoneTime > 0 {
 		g.milestoneTime--
 	}
@@ -322,7 +348,6 @@ func (g *Game) Update() error {
 		}
 	}
 
-	// Move zones — positive zones start moving at level 3 (was 6)
 	for i := range g.zones {
 		z := &g.zones[i]
 		if z.power > 0 && g.level < 3 {
@@ -355,7 +380,7 @@ func (g *Game) initAudio() {
 		g.audioCtx = audio.NewContext(sampleRate)
 	}
 	if g.audioCtx != nil && !g.audioStarted {
-		g.music = &musicalEngine{game: g}
+		g.music = &voiceEngine{game: g}
 		var err error
 		g.player, err = g.audioCtx.NewPlayer(g.music)
 		if err == nil {
@@ -412,7 +437,6 @@ func (g *Game) initZones() {
 			radius: radius,
 		})
 	}
-	// Start with 2 interference zones, cap at 6
 	numNeg := 2 + g.level/2
 	if numNeg > 6 {
 		numNeg = 6
@@ -427,13 +451,24 @@ func (g *Game) initZones() {
 			radius: 80,
 		})
 	}
+	// Pre-load stored name so intro screen can show it immediately
+	if g.playerName == "" {
+		val := js.Global().Get("localStorage").Call("getItem", "cyber_player_name")
+		if !val.IsNull() && !val.IsUndefined() {
+			if stored := val.String(); stored != "" {
+				g.playerName = stored
+			}
+		}
+	}
 	g.loadScores()
 }
 
 func (g *Game) getPlayerName() string {
-	stored := js.Global().Get("localStorage").Call("getItem", "cyber_player_name").String()
-	if stored != "null" && stored != "" {
-		return stored
+	val := js.Global().Get("localStorage").Call("getItem", "cyber_player_name")
+	if !val.IsNull() && !val.IsUndefined() {
+		if stored := val.String(); stored != "" {
+			return stored
+		}
 	}
 	result := js.Global().Call("prompt", "ENTER YOUR NAME:", "PLAYER")
 	name := "PLAYER"
@@ -515,63 +550,118 @@ func (g *Game) updateParticles() {
 	}
 }
 
-// --- Musical Synthesizer Engine ---
-// Pentatonic C major scale (C4–E5)
-var pentatonic = []float64{
-	261.63, // C4
-	293.66, // D4
-	329.63, // E4
-	392.00, // G4
-	440.00, // A4
-	523.25, // C5
-	587.33, // D5
-	659.25, // E5
+// --- Voice Engine ---
+// Gameplay: low moan that rises in pitch and pace with syncLevel.
+// Win: rapid climax arc — pitch peaks then settles.
+
+type voiceEngine struct {
+	game        *Game
+	phase       float64
+	vibratoPhase float64
+	breathPhase  float64
+	breathAcc    float64
+	wasWin      bool // detects win transition to reset state
+	wasPlaying  bool // detects touch-start to sync breath phase
 }
 
-// 16-step melodic pattern (indices into pentatonic[])
-var melody = []int{0, 2, 4, 5, 4, 2, 4, 7, 0, 2, 4, 5, 7, 5, 4, 2}
-
-type musicalEngine struct {
-	game     *Game
-	phase    float64 // sine oscillator phase in radians
-	noteFrac float64 // 0..1 progress within current note
-	noteIdx  int
-}
-
-func (m *musicalEngine) Read(p []byte) (int, error) {
+func (m *voiceEngine) Read(p []byte) (int, error) {
 	for i := 0; i < len(p)/4; i++ {
-		// Tempo: 80 BPM at sync=0 → 200 BPM at sync=1, eighth notes
-		bpm := 80.0 + m.game.syncLevel*120.0
-		noteAdvance := bpm / (float64(sampleRate) * 60.0 * 2.0)
+		sync := m.game.syncLevel
+		isWin := m.game.win
+		winTime := m.game.winTime
+		isPlaying := m.game.isTouching || isWin
 
-		m.noteFrac += noteAdvance
-		if m.noteFrac >= 1.0 {
-			m.noteFrac -= 1.0
-			m.noteIdx = (m.noteIdx + 1) % len(melody)
-			m.phase = 0 // clean phase reset per note avoids clicks
+		// Reset breath to peak on first touch — moan starts immediately audible
+		if isPlaying && !m.wasPlaying {
+			m.breathPhase = math.Pi / 2
+		}
+		m.wasPlaying = isPlaying
+
+		// Reset and re-sync on win start — clear break from gameplay moan
+		if isWin && !m.wasWin {
+			m.breathPhase = math.Pi / 2
+			m.phase = 0
+		}
+		m.wasWin = isWin
+
+		var baseFreq, breathRate, vibratoAmp float64
+
+		if isWin {
+			winP := math.Min(1.0, winTime/112.0)
+			// Rapid staccato panting: starts fast, peaks, then settles
+			breathRate = 3.0 + winP*0.5 // 3.0 → 3.5 Hz (fast from the first moment)
+			// Pitch arc: starts high, peaks, then resolves
+			var curve float64
+			if winP < 0.35 {
+				curve = winP / 0.35
+			} else if winP < 0.65 {
+				curve = 1.0
+			} else {
+				curve = 1.0 - (winP-0.65)/0.35*0.45
+			}
+			baseFreq = 320.0 + curve*200.0  // 320 → 520 Hz at peak (clearly higher than gameplay)
+			vibratoAmp = 0.02 + curve*0.03   // trembling at climax
+		} else {
+			// Gameplay: female voice range, rises with sync
+			baseFreq = 180.0 + sync*180.0   // 180 → 360 Hz (female range)
+			breathRate = 0.7 + sync*1.1     // 0.7 → 1.8 Hz
+			vibratoAmp = 0.012 + sync*0.018 // expressive throughout
 		}
 
-		// Envelope: fast attack → slight decay sustain → release
-		frac := m.noteFrac
-		var env float64
-		switch {
-		case frac < 0.05:
-			env = frac / 0.05
-		case frac < 0.75:
-			env = 1.0 - (frac-0.05)/0.70*0.2 // 1.0 → 0.8
-		default:
-			env = 0.8 * (1.0 - (frac-0.75)/0.25)
+		// Vibrato LFO at 5.5 Hz
+		m.vibratoPhase += 2 * math.Pi * 5.5 / float64(sampleRate)
+		if m.vibratoPhase > 2*math.Pi {
+			m.vibratoPhase -= 2 * math.Pi
+		}
+		vibrato := 1.0 + vibratoAmp*math.Sin(m.vibratoPhase)
+
+		// Breath rhythm: half-sine pulses
+		// Win: staccato (0→1, clear gaps)
+		// Gameplay: continuous (0.15→1)
+		m.breathPhase += 2 * math.Pi * breathRate / float64(sampleRate)
+		if m.breathPhase > 2*math.Pi {
+			m.breathPhase -= 2 * math.Pi
+		}
+		breathRaw := math.Max(0, math.Sin(m.breathPhase))
+		var breathEnv float64
+		if isWin {
+			breathEnv = breathRaw
+		} else {
+			breathEnv = 0.15 + 0.85*breathRaw
 		}
 
-		// Sine + harmonics for a bell-like timbre
-		freq := pentatonic[melody[m.noteIdx]]
+		// Friction: movement speed intensifies the moan (more motion = louder/fuller)
+		if !isWin {
+			speedNorm := math.Min(1.0, m.game.fingerSpeed/25.0)
+			breathEnv *= 0.35 + 0.65*speedNorm
+		}
+
+		// Pitch rises with breath amplitude (natural vocal inflection)
+		pitchInflect := 1.0 + 0.07*breathRaw
+		freq := baseFreq * vibrato * pitchInflect
+
 		m.phase += 2 * math.Pi * freq / float64(sampleRate)
 		if m.phase > 2*math.Pi {
 			m.phase -= 2 * math.Pi
 		}
-		sample := (math.Sin(m.phase)*0.45 + math.Sin(m.phase*2)*0.12 + math.Sin(m.phase*3)*0.04) * env
 
-		// Binaural pan based on finger X position
+		// Harmonic series — brighter weights for female timbre
+		sample := (math.Sin(m.phase)*0.38 +
+			math.Sin(m.phase*2)*0.24 + // strong 2nd — characteristic of female voice
+			math.Sin(m.phase*3)*0.16 +
+			math.Sin(m.phase*4)*0.09 +
+			math.Sin(m.phase*5)*0.07 + // upper brightness
+			math.Sin(m.phase*6)*0.03 +
+			math.Sin(m.phase*7)*0.01) * breathEnv
+
+		// Airy breath noise
+		m.breathAcc = (m.breathAcc + (rand.Float64()*2-1)*0.08) * 0.95
+		sample += m.breathAcc * 0.03 * breathEnv
+
+		// Soft clip
+		sample = math.Tanh(sample * 1.1)
+
+		// Binaural pan
 		pan := 0.5
 		if m.game.screenWidth > 0 {
 			pan = m.game.fingerX / float64(m.game.screenWidth)
@@ -627,13 +717,16 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	}
 
 	dict := translations[g.lang]
-	ebitenutil.DebugPrintAt(screen, fmt.Sprintf(">> %s: %d", dict["lvl"], g.level+1), 20, 75)
-	if g.comboCount > 5 && !g.win && !g.showLeaderboard && !g.gameOver {
-		comboMul := 1.0 + float64(g.comboCount)/60.0
-		ebitenutil.DebugPrintAt(screen, fmt.Sprintf("%s %.1fx", dict["combo"], comboMul), 20, 95)
+
+	if g.gameStarted {
+		ebitenutil.DebugPrintAt(screen, fmt.Sprintf(">> %s: %d", dict["lvl"], g.level+1), 20, 75)
+		if g.comboCount > 5 && !g.win && !g.showLeaderboard && !g.gameOver {
+			comboMul := 1.0 + float64(g.comboCount)/60.0
+			ebitenutil.DebugPrintAt(screen, fmt.Sprintf("%s %.1fx", dict["combo"], comboMul), 20, 95)
+		}
 	}
 
-	if g.gameOver || g.win || g.showLeaderboard {
+	if g.gameOver || g.win || (g.showLeaderboard && g.gameStarted) {
 		boxH := float32(240)
 		if g.gameOver {
 			boxH = 280
@@ -661,18 +754,15 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		if g.gameOver {
 			ebitenutil.DebugPrintAt(screen, ">> TAP TO RETRY <<", w/2-72, h/2+90)
 		}
-	} else {
+	} else if g.gameStarted {
 		barW := float32(w - 60)
 		barY := float32(h - 40)
 		vector.DrawFilledRect(screen, 30, barY, barW, 6, color.RGBA{40, 40, 40, 150}, true)
 		vector.DrawFilledRect(screen, 30, barY, barW*float32(g.syncLevel), 6, color.RGBA{255, 255, 255, 220}, true)
-		// Milestone tick marks at 25%, 50%, 75%
 		for _, t := range []float32{0.25, 0.50, 0.75} {
 			mx := float32(30) + barW*t
 			vector.DrawFilledRect(screen, mx-1, barY-2, 2, 10, color.RGBA{0, 200, 255, 180}, true)
 		}
-
-		// Timer bar — green → orange → red as time runs out
 		timerFrac := float32(g.timeLeft) / float32(levelDuration(g.level))
 		timerCol := color.RGBA{0, 200, 100, 200}
 		if g.timeLeft < 5.0 {
@@ -683,33 +773,42 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		vector.DrawFilledRect(screen, 0, 62, float32(w)*timerFrac, 4, timerCol, true)
 	}
 
-	// Milestone popup overlay
 	if g.milestoneTime > 0 && !g.win && !g.gameOver {
 		alpha := float64(g.milestoneTime) / 90.0
 		vector.DrawFilledRect(screen, 0, 0, float32(w), float32(h), color.RGBA{0, 200, 255, uint8(alpha * 35)}, true)
 		ebitenutil.DebugPrintAt(screen, g.milestoneMsg, w/2-35, h/2-10)
 	}
 
+	// Intro screen overlay
+	if !g.gameStarted {
+		vector.DrawFilledRect(screen, 30, float32(h/2-130), float32(w-60), 260, color.RGBA{0, 0, 0, 210}, true)
+		ebitenutil.DebugPrintAt(screen, "CYBER EUPHORIA", w/2-56, h/2-110)
+		if g.playerName != "" {
+			ebitenutil.DebugPrintAt(screen, "PLAYER: "+g.playerName, w/2-52, h/2-80)
+			ebitenutil.DebugPrintAt(screen, ">> TAP TO START <<", w/2-72, h/2-40)
+		} else {
+			ebitenutil.DebugPrintAt(screen, ">> TAP TO ENTER NAME <<", w/2-88, h/2-80)
+		}
+		ebitenutil.DebugPrintAt(screen, "MOVE FINGER IN GLOWING", w/2-88, h/2-10)
+		ebitenutil.DebugPrintAt(screen, " ZONES TO FILL THE BAR", w/2-88, h/2+10)
+	}
+
 	// HEADER BUTTONS
-	// EXIT (Red)
 	vector.DrawFilledRect(screen, float32(w-80), 10, 70, 40, color.RGBA{180, 0, 50, 200}, true)
 	ebitenutil.DebugPrintAt(screen, dict["exit"], w-70, 25)
-	// LANGUAGE (Blue)
 	vector.DrawFilledRect(screen, 10, 10, 90, 40, color.RGBA{0, 100, 200, 200}, true)
 	ebitenutil.DebugPrintAt(screen, dict["lang"], 20, 25)
-	// NAME reset (Teal)
+	vector.DrawFilledRect(screen, 110, 10, 50, 40, color.RGBA{200, 150, 0, 200}, true)
+	tx, ty := float32(135), float32(30)
+	vector.DrawFilledRect(screen, tx-6, ty+5, 12, 2, color.White, true)
+	vector.StrokeLine(screen, tx, ty+5, tx, ty, 2, color.White, true)
+	vector.DrawFilledCircle(screen, tx, ty-4, 5, color.White, true)
 	vector.DrawFilledRect(screen, 170, 10, 60, 40, color.RGBA{0, 140, 120, 200}, true)
 	nameLabel := g.playerName
 	if nameLabel == "" {
 		nameLabel = "NAME?"
 	}
 	ebitenutil.DebugPrintAt(screen, nameLabel, 178, 25)
-	// SCORES (Golden + Trophy Icon)
-	vector.DrawFilledRect(screen, 110, 10, 50, 40, color.RGBA{200, 150, 0, 200}, true)
-	tx, ty := float32(135), float32(30)
-	vector.DrawFilledRect(screen, tx-6, ty+5, 12, 2, color.White, true)
-	vector.StrokeLine(screen, tx, ty+5, tx, ty, 2, color.White, true)
-	vector.DrawFilledCircle(screen, tx, ty-4, 5, color.White, true)
 }
 
 func (g *Game) Layout(w, h int) (int, int) { return w, h }
@@ -719,7 +818,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	game := &Game{lang: "es", shader: s}
+	game := &Game{lang: "en", shader: s}
 	ebiten.SetWindowSize(400, 800)
 	if err := ebiten.RunGame(game); err != nil {
 		panic(err)
