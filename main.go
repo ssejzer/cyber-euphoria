@@ -597,6 +597,7 @@ type voiceEngine struct {
 	vibratoPhase float64
 	breathPhase  float64
 	breathAcc    float64
+	lpState     float64 // one-pole low-pass filter state
 	wasWin      bool // detects win transition to reset state
 	wasPlaying  bool // detects touch-start to sync breath phase
 }
@@ -674,7 +675,7 @@ func (m *voiceEngine) Read(p []byte) (int, error) {
 		}
 
 		// Pitch rises with breath amplitude (natural vocal inflection)
-		pitchInflect := 1.0 + 0.07*breathRaw
+		pitchInflect := 1.0 + 0.04*breathRaw
 		freq := baseFreq * vibrato * pitchInflect
 
 		m.phase += 2 * math.Pi * freq / float64(sampleRate)
@@ -682,21 +683,26 @@ func (m *voiceEngine) Read(p []byte) (int, error) {
 			m.phase -= 2 * math.Pi
 		}
 
-		// Harmonic series — brighter weights for female timbre
-		sample := (math.Sin(m.phase)*0.38 +
-			math.Sin(m.phase*2)*0.24 + // strong 2nd — characteristic of female voice
-			math.Sin(m.phase*3)*0.16 +
-			math.Sin(m.phase*4)*0.09 +
-			math.Sin(m.phase*5)*0.07 + // upper brightness
-			math.Sin(m.phase*6)*0.03 +
-			math.Sin(m.phase*7)*0.01) * breathEnv
+		// Harmonic series — fewer upper harmonics to reduce buzz
+		sample := (math.Sin(m.phase)*0.55 +
+			math.Sin(m.phase*2)*0.28 + // strong 2nd — characteristic of female voice
+			math.Sin(m.phase*3)*0.11 +
+			math.Sin(m.phase*4)*0.05 +
+			math.Sin(m.phase*5)*0.01) * breathEnv
 
-		// Airy breath noise
-		m.breathAcc = (m.breathAcc + (rand.Float64()*2-1)*0.08) * 0.95
-		sample += m.breathAcc * 0.03 * breathEnv
+		// Airy breath noise — reduced to avoid buzziness
+		m.breathAcc = (m.breathAcc + (rand.Float64()*2-1)*0.04) * 0.97
+		sample += m.breathAcc * 0.02 * breathEnv
 
-		// Soft clip
-		sample = math.Tanh(sample * 1.1)
+		// Soft clip — reduced drive to avoid adding distortion harmonics
+		sample = math.Tanh(sample * 0.75)
+
+		// One-pole low-pass filter to smooth out high-frequency buzz
+		// Cutoff rises with sync: 800 Hz at rest → 1600 Hz at full sync
+		fc := 800.0 + sync*800.0
+		alpha := 1.0 - math.Exp(-2*math.Pi*fc/float64(sampleRate))
+		m.lpState += alpha * (sample - m.lpState)
+		sample = m.lpState
 
 		// Binaural pan
 		pan := 0.5
