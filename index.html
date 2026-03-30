@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Cyber Euphoria</title>
+    <script src="wasm_exec.js"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            color: #fff;
+            font-family: 'Courier New', Courier, monospace;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+        #overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.9);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+            text-align: center;
+            padding: 20px;
+        }
+        button {
+            background: #ff00cc;
+            color: white;
+            border: none;
+            padding: 20px 40px;
+            font-size: 1.5rem;
+            cursor: pointer;
+            margin-top: 20px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            box-shadow: 0 0 20px #ff00cc;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div id="overlay">
+        <h1 id="title">CYBER EUPHORIA</h1>
+        <p id="desc">Connect with the digital core. Rub and move to reach synchrony.</p>
+        <button id="start-btn">INITIALIZE</button>
+    </div>
+
+    <script>
+        const go = new Go();
+        // Añadimos un timestamp para evitar que el teléfono use la versión vieja guardada en caché
+        const wasmUrl = "main.wasm?v=" + new Date().getTime();
+        
+        WebAssembly.instantiateStreaming(fetch(wasmUrl), go.importObject).then((result) => {
+            const inst = result.instance;
+            document.getElementById('start-btn').addEventListener('click', async () => {
+                if (typeof DeviceMotionEvent.requestPermission === 'function') {
+                    try {
+                        const permission = await DeviceMotionEvent.requestPermission();
+                        if (permission === 'granted') startSensors();
+                    } catch (e) { console.error(e); }
+                } else {
+                    startSensors();
+                }
+                document.getElementById('overlay').style.display = 'none';
+                go.run(inst);
+            });
+        });
+
+        function startSensors() {
+            window.addEventListener('devicemotion', (event) => {
+                const accel = event.accelerationIncludingGravity;
+                if (accel && window.updateMotion) {
+                    const total = Math.sqrt(accel.x*accel.x + accel.y*accel.y + accel.z*accel.z);
+                    window.updateMotion(total);
+                }
+            });
+        }
+
+        const userLang = navigator.language || navigator.userLanguage;
+        if (userLang.startsWith('es')) {
+            document.getElementById('title').innerText = "CIBER EUFORIA";
+            document.getElementById('desc').innerText = "Conecta con el núcleo. Frota y mueve para alcanzar la sincronía.";
+            document.getElementById('start-btn').innerText = "INICIAR";
+        }
+    </script>
+</body>
+</html>

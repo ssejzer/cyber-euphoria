@@ -1,0 +1,10 @@
+AddType application/wasm .wasm
+
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE application/wasm
+</IfModule>
+
+<IfModule mod_headers.c>
+    # Eliminamos las políticas de Cross-Origin que pueden causar el error "Playback unavailable"
+    Header set Access-Control-Allow-Origin "*"
+</IfModule>
