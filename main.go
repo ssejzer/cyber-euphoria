@@ -1,12 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"image/color"
 	"math"
 	"math/rand"
-	"sort"
-	"strconv"
 	"strings"
 	"syscall/js"
 	"time"
@@ -45,6 +44,33 @@ type Particle struct {
 type ScoreEntry struct {
 	name  string
 	level int
+}
+
+type serverScore struct {
+	Name  string `json:"name"`
+	Level int    `json:"level"`
+}
+
+// HTTP helpers using synchronous XHR (same-origin, localhost)
+func httpGetJSON(url string) string {
+	xhr := js.Global().Get("XMLHttpRequest").New()
+	xhr.Call("open", "GET", url, false)
+	xhr.Call("send")
+	if xhr.Get("status").Int() == 200 {
+		return xhr.Get("responseText").String()
+	}
+	return ""
+}
+
+func httpPostJSON(url, body string) string {
+	xhr := js.Global().Get("XMLHttpRequest").New()
+	xhr.Call("open", "POST", url, false)
+	xhr.Call("setRequestHeader", "Content-Type", "application/json")
+	xhr.Call("send", body)
+	if xhr.Get("status").Int() == 200 {
+		return xhr.Get("responseText").String()
+	}
+	return ""
 }
 
 // --- Kage Shader (Neon Aesthetic) ---
@@ -99,7 +125,7 @@ type Game struct {
 	particles        []*Particle
 	audioCtx         *audio.Context
 	audioStarted     bool
-	asmr             *asmrEngine
+	music            *musicalEngine
 	player           *audio.Player
 	scores           []ScoreEntry
 	isTouching       bool
@@ -166,6 +192,10 @@ func (g *Game) Update() error {
 		}
 		if tx > 110 && tx < 160 && ty < 60 {
 			g.showLeaderboard = !g.showLeaderboard
+		}
+		if tx > 170 && tx < 230 && ty < 60 {
+			js.Global().Get("localStorage").Call("removeItem", "cyber_player_name")
+			g.playerName = ""
 		}
 	}
 
@@ -252,6 +282,9 @@ func (g *Game) Update() error {
 						g.comboCount++
 					}
 				}
+			} else {
+				// Finger is still — must keep moving or sync drains
+				friction = -(0.001 + g.syncLevel*0.004)
 			}
 		}
 		g.lastX, g.lastY = int(g.fingerX), int(g.fingerY)
@@ -322,9 +355,9 @@ func (g *Game) initAudio() {
 		g.audioCtx = audio.NewContext(sampleRate)
 	}
 	if g.audioCtx != nil && !g.audioStarted {
-		g.asmr = &asmrEngine{game: g}
+		g.music = &musicalEngine{game: g}
 		var err error
-		g.player, err = g.audioCtx.NewPlayer(g.asmr)
+		g.player, err = g.audioCtx.NewPlayer(g.music)
 		if err == nil {
 			g.player.SetVolume(0)
 			g.player.Play()
@@ -379,7 +412,7 @@ func (g *Game) initZones() {
 			radius: radius,
 		})
 	}
-	// Start with 2 interference zones (was 1), cap at 6
+	// Start with 2 interference zones, cap at 6
 	numNeg := 2 + g.level/2
 	if numNeg > 6 {
 		numNeg = 6
@@ -419,51 +452,52 @@ func (g *Game) getPlayerName() string {
 }
 
 func (g *Game) loadScores() {
-	raw := js.Global().Get("localStorage").Call("getItem", "cyber_scores").String()
-	var entries []ScoreEntry
-	if raw != "null" && raw != "" {
-		for _, s := range strings.Split(raw, ",") {
-			parts := strings.SplitN(s, "|", 2)
-			if len(parts) == 2 {
-				val, err := strconv.Atoi(parts[1])
-				if err == nil {
-					entries = append(entries, ScoreEntry{name: parts[0], level: val})
-				}
-			} else {
-				// backward compat: old format without name
-				val, err := strconv.Atoi(s)
-				if err == nil {
-					entries = append(entries, ScoreEntry{name: "PLAYER", level: val})
-				}
-			}
-		}
+	resp := httpGetJSON("/leaderboard")
+	if resp == "" {
+		return
 	}
-	g.scores = entries
+	var entries []serverScore
+	if err := json.Unmarshal([]byte(resp), &entries); err != nil {
+		return
+	}
+	g.scores = nil
+	for i, e := range entries {
+		if i >= 5 {
+			break
+		}
+		g.scores = append(g.scores, ScoreEntry{name: e.Name, level: e.Level})
+	}
 }
 
 func (g *Game) saveScore() {
 	if g.playerName == "" {
 		g.playerName = g.getPlayerName()
 	}
-	g.loadScores()
-	g.scores = append(g.scores, ScoreEntry{name: g.playerName, level: g.level + 1})
-	sort.Slice(g.scores, func(i, j int) bool { return g.scores[i].level > g.scores[j].level })
-	if len(g.scores) > 5 {
-		g.scores = g.scores[:5]
+	payload := serverScore{Name: g.playerName, Level: g.level + 1}
+	data, _ := json.Marshal(payload)
+	resp := httpPostJSON("/leaderboard", string(data))
+	if resp == "" {
+		return
 	}
-	var parts []string
-	for _, e := range g.scores {
-		parts = append(parts, e.name+"|"+strconv.Itoa(e.level))
+	var entries []serverScore
+	if err := json.Unmarshal([]byte(resp), &entries); err != nil {
+		return
 	}
-	js.Global().Get("localStorage").Call("setItem", "cyber_scores", strings.Join(parts, ","))
+	g.scores = nil
+	for i, e := range entries {
+		if i >= 5 {
+			break
+		}
+		g.scores = append(g.scores, ScoreEntry{name: e.Name, level: e.Level})
+	}
 }
 
 func (g *Game) spawnParticles(x, y float64, n int) {
 	for i := 0; i < n; i++ {
 		g.particles = append(g.particles, &Particle{
 			x: x, y: y,
-			vx: (rand.Float64() - 0.5) * 5,
-			vy: (rand.Float64() - 0.5) * 5,
+			vx:   (rand.Float64() - 0.5) * 5,
+			vy:   (rand.Float64() - 0.5) * 5,
 			life: 1.0,
 		})
 	}
@@ -481,35 +515,79 @@ func (g *Game) updateParticles() {
 	}
 }
 
-// --- Deep Organic ASMR Engine ---
-type asmrEngine struct {
-	game                 *Game
-	lastBrown            float64
-	lpFilterL, lpFilterR float64
-	breath               float64
+// --- Musical Synthesizer Engine ---
+// Pentatonic C major scale (C4–E5)
+var pentatonic = []float64{
+	261.63, // C4
+	293.66, // D4
+	329.63, // E4
+	392.00, // G4
+	440.00, // A4
+	523.25, // C5
+	587.33, // D5
+	659.25, // E5
 }
 
-func (a *asmrEngine) Read(p []byte) (int, error) {
+// 16-step melodic pattern (indices into pentatonic[])
+var melody = []int{0, 2, 4, 5, 4, 2, 4, 7, 0, 2, 4, 5, 7, 5, 4, 2}
+
+type musicalEngine struct {
+	game     *Game
+	phase    float64 // sine oscillator phase in radians
+	noteFrac float64 // 0..1 progress within current note
+	noteIdx  int
+}
+
+func (m *musicalEngine) Read(p []byte) (int, error) {
 	for i := 0; i < len(p)/4; i++ {
-		white := rand.Float64()*2 - 1
-		a.lastBrown = (a.lastBrown + (0.01 * white)) / 1.002
-		base := a.lastBrown * 0.4
-		a.breath += 0.0004
-		breathMod := (math.Sin(a.breath) + 1.0) / 2.0
-		whisper := white * 0.15 * breathMod
-		pan := a.game.fingerX / float64(a.game.screenWidth)
-		if pan < 0 {
-			pan = 0
+		// Tempo: 80 BPM at sync=0 → 200 BPM at sync=1, eighth notes
+		bpm := 80.0 + m.game.syncLevel*120.0
+		noteAdvance := bpm / (float64(sampleRate) * 60.0 * 2.0)
+
+		m.noteFrac += noteAdvance
+		if m.noteFrac >= 1.0 {
+			m.noteFrac -= 1.0
+			m.noteIdx = (m.noteIdx + 1) % len(melody)
+			m.phase = 0 // clean phase reset per note avoids clicks
 		}
-		if pan > 1 {
-			pan = 1
+
+		// Envelope: fast attack → slight decay sustain → release
+		frac := m.noteFrac
+		var env float64
+		switch {
+		case frac < 0.05:
+			env = frac / 0.05
+		case frac < 0.75:
+			env = 1.0 - (frac-0.05)/0.70*0.2 // 1.0 → 0.8
+		default:
+			env = 0.8 * (1.0 - (frac-0.75)/0.25)
 		}
-		raw := base + whisper
-		a.lpFilterL = a.lpFilterL + 0.05*(raw-a.lpFilterL)
-		a.lpFilterR = a.lpFilterR + 0.05*(raw-a.lpFilterR)
-		sl := int16(a.lpFilterL * (1.0 - pan) * 32767)
-		sr := int16(a.lpFilterR * pan * 32767)
-		p[4*i], p[4*i+1], p[4*i+2], p[4*i+3] = byte(sl), byte(sl>>8), byte(sr), byte(sr>>8)
+
+		// Sine + harmonics for a bell-like timbre
+		freq := pentatonic[melody[m.noteIdx]]
+		m.phase += 2 * math.Pi * freq / float64(sampleRate)
+		if m.phase > 2*math.Pi {
+			m.phase -= 2 * math.Pi
+		}
+		sample := (math.Sin(m.phase)*0.45 + math.Sin(m.phase*2)*0.12 + math.Sin(m.phase*3)*0.04) * env
+
+		// Binaural pan based on finger X position
+		pan := 0.5
+		if m.game.screenWidth > 0 {
+			pan = m.game.fingerX / float64(m.game.screenWidth)
+			if pan < 0 {
+				pan = 0
+			}
+			if pan > 1 {
+				pan = 1
+			}
+		}
+		sl := int16(sample * (1.0 - pan*0.5) * 32767)
+		sr := int16(sample * (0.5 + pan*0.5) * 32767)
+		p[4*i] = byte(sl)
+		p[4*i+1] = byte(sl >> 8)
+		p[4*i+2] = byte(sr)
+		p[4*i+3] = byte(sr >> 8)
 	}
 	return len(p), nil
 }
@@ -619,6 +697,13 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	// LANGUAGE (Blue)
 	vector.DrawFilledRect(screen, 10, 10, 90, 40, color.RGBA{0, 100, 200, 200}, true)
 	ebitenutil.DebugPrintAt(screen, dict["lang"], 20, 25)
+	// NAME reset (Teal)
+	vector.DrawFilledRect(screen, 170, 10, 60, 40, color.RGBA{0, 140, 120, 200}, true)
+	nameLabel := g.playerName
+	if nameLabel == "" {
+		nameLabel = "NAME?"
+	}
+	ebitenutil.DebugPrintAt(screen, nameLabel, 178, 25)
 	// SCORES (Golden + Trophy Icon)
 	vector.DrawFilledRect(screen, 110, 10, 50, 40, color.RGBA{200, 150, 0, 200}, true)
 	tx, ty := float32(135), float32(30)

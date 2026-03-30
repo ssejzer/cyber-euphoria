@@ -1,5 +1,8 @@
 AddType application/wasm .wasm
 
+RewriteEngine On
+RewriteRule ^leaderboard$ leaderboard.php [L,QSA]
+
 <IfModule mod_deflate.c>
     AddOutputFilterByType DEFLATE application/wasm
 </IfModule>
