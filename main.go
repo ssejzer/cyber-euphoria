@@ -22,24 +22,29 @@ const (
 	sampleRate = 44100
 )
 
-// --- Translations (Transliterated for font compatibility) ---
 type Dictionary map[string]string
+
 var translations = map[string]Dictionary{
-	"en": {"title": "CYBER EUPHORIA", "win": "SYNERGY REACHED", "exit": "EXIT", "lvl": "LEVEL", "best": "SCORES", "lang": "LANG: EN"},
-	"es": {"title": "CIBER EUFORIA", "win": "SINERGIA ALCANZADA", "exit": "SALIR", "lvl": "NIVEL", "best": "RECORDS", "lang": "IDIO: ES"},
-	"ru": {"title": "KIBER EYFORIYA", "win": "SINERGIYA DOSTIGNUTA", "exit": "VYKHOD", "lvl": "UROVEN", "best": "REKORDY", "lang": "YAZYK: RU"},
+	"en": {"win": "SYNERGY REACHED", "exit": "EXIT", "lvl": "LEVEL", "best": "SCORES", "lang": "LANG: EN", "combo": "COMBO", "streak": "STREAK", "over": "GAME OVER"},
+	"es": {"win": "SINERGIA ALCANZADA", "exit": "SALIR", "lvl": "NIVEL", "best": "RECORDS", "lang": "IDIO: ES", "combo": "COMBO", "streak": "RACHA", "over": "JUEGO TERMINADO"},
+	"ru": {"win": "SINERGIYA DOSTIGNUTA", "exit": "VYKHOD", "lvl": "UROVEN", "best": "REKORDY", "lang": "YAZYK: RU", "combo": "KOMBO", "streak": "SERIYA", "over": "KONETS IGRY"},
 }
 var langOrder = []string{"es", "en", "ru"}
 
 type Zone struct {
 	x, y, vx, vy float64
-	power        float64
-	radius       float64
+	power         float64
+	radius        float64
 }
 
 type Particle struct {
 	x, y, vx, vy float64
-	life         float64
+	life          float64
+}
+
+type ScoreEntry struct {
+	name  string
+	level int
 }
 
 // --- Kage Shader (Neon Aesthetic) ---
@@ -56,97 +61,149 @@ func Fragment(position vec4, texCoord vec2, color vec4) vec4 {
 	p := (texCoord - 0.5) * 2.0
 	dist := length(p)
 	t := Time
-	sync := Cursor.x 
+	sync := Cursor.x
 	winProgress := WinTime / 400.0
-	
-	// Dynamic core radius
+
 	radius := 0.2 + (0.12 * sin(t * 3.0) * sync) + (winProgress * 5.0)
 	glow := 0.012 / abs(dist - radius)
-	
+
 	cyan := vec3(0.0, 0.8, 1.0)
 	magenta := vec3(1.0, 0.1, 0.8)
 	red := vec3(1.0, 0.0, 0.0)
-	
+
 	finalCol := mix(cyan, magenta, sync)
 	if ZoneType > 0.5 {
 		finalCol = mix(finalCol, vec3(1.0), 0.4)
 	} else if ZoneType < -0.5 {
 		finalCol = mix(finalCol, red, 0.6)
 	}
-	
+
 	flash := step(0.98, sin(winProgress * 20.0)) * winProgress
 	return vec4(mix(finalCol * glow, vec3(1.0), flash), glow + flash)
 }
 `)
 
 type Game struct {
-	lang           string
-	level          int
-	syncLevel      float64
-	motionVal      float64
-	win            bool
-	winTime        float64
-	time           float64
-	shader         *ebiten.Shader
-	lastX, lastY   int
-	screenWidth    int
-	screenHeight   int
-	zones          []Zone
-	particles      []*Particle
-	audioCtx       *audio.Context
-	audioStarted   bool
-	asmr           *asmrEngine
-	player         *audio.Player
-	scores         []int
-	isTouching     bool
-	showLeaderboard bool
+	lang             string
+	level            int
+	syncLevel        float64
+	motionVal        float64
+	win              bool
+	winTime          float64
+	time             float64
+	shader           *ebiten.Shader
+	lastX, lastY     int
+	screenWidth      int
+	screenHeight     int
+	zones            []Zone
+	particles        []*Particle
+	audioCtx         *audio.Context
+	audioStarted     bool
+	asmr             *asmrEngine
+	player           *audio.Player
+	scores           []ScoreEntry
+	isTouching       bool
+	showLeaderboard  bool
 	currentZonePower float64
 	fingerX, fingerY float64
-	fingerSpeed    float64
+	fingerSpeed      float64
+	comboCount       int
+	milestones       [3]bool
+	milestoneTime    float64
+	milestoneMsg     string
+	levelStreak      int
+	timeLeft         float64
+	gameOver         bool
+	playerName       string
+}
+
+func levelDuration(level int) float64 {
+	t := 25.0 - float64(level)
+	if t < 15.0 {
+		t = 15.0
+	}
+	return t
 }
 
 func (g *Game) Update() error {
 	g.time += 1.0 / 60.0
 	touchIDs := ebiten.AppendTouchIDs(nil)
 	g.isTouching = len(touchIDs) > 0 || ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft)
+	if !g.audioStarted && g.isTouching {
+		g.initAudio()
+	}
 
-	// Initialize audio on first user interaction
-	if !g.audioStarted && g.isTouching { g.initAudio() }
+	// Wait for Draw to set screen dimensions and initialize zones
+	if g.screenWidth == 0 {
+		return nil
+	}
 
-	// Button Interaction Logic
 	justTouched := false
 	var tx, ty int
 	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
-		justTouched = true; tx, ty = ebiten.CursorPosition()
+		justTouched = true
+		tx, ty = ebiten.CursorPosition()
 	} else {
 		justIDs := inpututil.AppendJustPressedTouchIDs(nil)
-		if len(justIDs) > 0 { justTouched = true; tx, ty = ebiten.TouchPosition(justIDs[0]) }
+		if len(justIDs) > 0 {
+			justTouched = true
+			tx, ty = ebiten.TouchPosition(justIDs[0])
+		}
 	}
 
 	if justTouched {
-		// Exit Button (Right)
-		if tx > g.screenWidth-100 && ty < 60 { js.Global().Get("window").Get("location").Call("reload") }
-		// Language Button (Left)
-		if tx < 100 && ty < 60 { g.nextLang() }
-		// Records Button (Center-Left)
-		if tx > 110 && tx < 160 && ty < 60 { g.showLeaderboard = !g.showLeaderboard }
+		// EXIT always works
+		if tx > g.screenWidth-100 && ty < 60 {
+			js.Global().Get("window").Get("location").Call("reload")
+		}
+		// Tap anywhere (except EXIT) restarts after game over
+		if g.gameOver {
+			g.resetGame()
+			return nil
+		}
+		if tx < 100 && ty < 60 {
+			g.nextLang()
+		}
+		if tx > 110 && tx < 160 && ty < 60 {
+			g.showLeaderboard = !g.showLeaderboard
+		}
 	}
 
-	// INSTANT HARDWARE VOLUME CONTROL (Zero-latency buffer bypass)
 	if g.player != nil {
 		vol := 0.0
 		if g.isTouching || g.win {
 			vol = g.syncLevel
-			if g.win { vol = 1.0 }
-			if vol < 0.1 && (g.isTouching || g.win) { vol = 0.1 }
+			if g.win {
+				vol = 1.0
+			}
+			if vol < 0.1 {
+				vol = 0.1
+			}
 		}
 		g.player.SetVolume(vol)
 	}
 
+	if g.gameOver {
+		return nil
+	}
+
 	if g.win {
 		g.winTime++
-		if g.winTime == 1 { g.saveScore() }
-		if g.winTime > 450 { g.nextLevel() }
+		if g.winTime == 1 {
+			g.saveScore()
+		}
+		if g.winTime > 450 {
+			g.nextLevel()
+		}
+		return nil
+	}
+
+	// Timer countdown — lose when it hits zero
+	g.timeLeft -= 1.0 / 60.0
+	if g.timeLeft <= 0 {
+		g.timeLeft = 0
+		g.gameOver = true
+		g.saveScore()
 		return nil
 	}
 
@@ -156,7 +213,11 @@ func (g *Game) Update() error {
 	g.fingerSpeed = 0
 	if g.isTouching {
 		var curX, curY int
-		if len(touchIDs) > 0 { curX, curY = ebiten.TouchPosition(touchIDs[0]) } else { curX, curY = ebiten.CursorPosition() }
+		if len(touchIDs) > 0 {
+			curX, curY = ebiten.TouchPosition(touchIDs[0])
+		} else {
+			curX, curY = ebiten.CursorPosition()
+		}
 		g.fingerX, g.fingerY = float64(curX), float64(curY)
 
 		for i := range g.zones {
@@ -176,38 +237,90 @@ func (g *Game) Update() error {
 			g.fingerSpeed = distMoved
 			if distMoved > 1.0 {
 				mul := 1.0
-				if g.currentZonePower != 0 { mul = math.Abs(g.currentZonePower) }
-				if g.currentZonePower < 0 { friction = -distMoved * 0.0005 } else { friction = distMoved * 0.00015 * mul }
+				if g.currentZonePower != 0 {
+					mul = math.Abs(g.currentZonePower)
+				}
+				if g.currentZonePower < 0 {
+					friction = -distMoved * 0.0006 // stronger interference drain
+					if g.comboCount > 0 {
+						g.comboCount -= 4
+					}
+				} else {
+					comboMul := 1.0 + float64(g.comboCount)/60.0 // up to 2x at max combo
+					friction = distMoved * 0.00012 * mul * comboMul
+					if g.comboCount < 60 {
+						g.comboCount++
+					}
+				}
 			}
 		}
 		g.lastX, g.lastY = int(g.fingerX), int(g.fingerY)
 	} else {
 		g.lastX, g.lastY = 0, 0
-		g.syncLevel -= 0.05 // Rapid drain
+		if g.comboCount > 0 {
+			g.comboCount -= 2
+		}
+		// Progressive drain: gentle when low, punishing when near goal
+		drain := 0.025 + g.syncLevel*0.07
+		g.syncLevel -= drain
 	}
 
 	g.syncLevel += friction + (g.motionVal * 0.005)
-	if g.syncLevel < 0 { g.syncLevel = 0 }
-	if g.syncLevel > 1.0 { g.syncLevel = 1.0; g.win = true }
+	if g.syncLevel < 0 {
+		g.syncLevel = 0
+	}
+	if g.syncLevel > 1.0 {
+		g.syncLevel = 1.0
+		g.win = true
+	}
 
-	// Move zones based on level difficulty
+	// Milestone celebrations at 25%, 50%, 75%
+	if g.milestoneTime > 0 {
+		g.milestoneTime--
+	}
+	thresholds := [3]float64{0.25, 0.50, 0.75}
+	msgs := [3]string{"25% SYNC!", "50% SYNC!", "75% SYNC!"}
+	for i, t := range thresholds {
+		if !g.milestones[i] && g.syncLevel >= t {
+			g.milestones[i] = true
+			g.milestoneTime = 90
+			g.milestoneMsg = msgs[i]
+			js.Global().Get("window").Get("navigator").Call("vibrate", 50)
+		}
+	}
+
+	// Move zones — positive zones start moving at level 3 (was 6)
 	for i := range g.zones {
 		z := &g.zones[i]
-		if z.power > 0 && g.level < 6 { continue }
-		z.x += z.vx; z.y += z.vy
-		if z.x < 50 || z.x > float64(g.screenWidth-50) { z.vx *= -1 }
-		if z.y < 100 || z.y > float64(g.screenHeight-100) { z.vy *= -1 }
+		if z.power > 0 && g.level < 3 {
+			continue
+		}
+		z.x += z.vx
+		z.y += z.vy
+		if z.x < 50 || z.x > float64(g.screenWidth-50) {
+			z.vx *= -1
+		}
+		if z.y < 100 || z.y > float64(g.screenHeight-100) {
+			z.vy *= -1
+		}
 	}
 	g.updateParticles()
 	return nil
 }
 
 func (g *Game) nextLang() {
-	for i, l := range langOrder { if l == g.lang { g.lang = langOrder[(i+1)%len(langOrder)]; return } }
+	for i, l := range langOrder {
+		if l == g.lang {
+			g.lang = langOrder[(i+1)%len(langOrder)]
+			return
+		}
+	}
 }
 
 func (g *Game) initAudio() {
-	if g.audioCtx == nil { g.audioCtx = audio.NewContext(sampleRate) }
+	if g.audioCtx == nil {
+		g.audioCtx = audio.NewContext(sampleRate)
+	}
 	if g.audioCtx != nil && !g.audioStarted {
 		g.asmr = &asmrEngine{game: g}
 		var err error
@@ -220,81 +333,182 @@ func (g *Game) initAudio() {
 	}
 }
 
-func (g *Game) nextLevel() { g.level++; g.win = false; g.winTime = 0; g.syncLevel = 0; g.initZones() }
+func (g *Game) nextLevel() {
+	g.levelStreak++
+	g.level++
+	g.win = false
+	g.winTime = 0
+	g.syncLevel = 0
+	g.comboCount = 0
+	g.timeLeft = levelDuration(g.level)
+	g.initZones()
+}
+
+func (g *Game) resetGame() {
+	g.level = 0
+	g.syncLevel = 0
+	g.win = false
+	g.winTime = 0
+	g.gameOver = false
+	g.levelStreak = 0
+	g.comboCount = 0
+	g.timeLeft = levelDuration(0)
+	g.initZones()
+}
 
 func (g *Game) initZones() {
 	rand.Seed(time.Now().UnixNano())
 	g.zones = nil
+	g.milestones = [3]bool{}
 	speed := 1.0 + float64(g.level)*0.2
+	radius := 90.0 - float64(g.level)*4.0
+	if radius < 35.0 {
+		radius = 35.0
+	}
 	for i := 0; i < 3; i++ {
 		vx, vy := 0.0, 0.0
-		if g.level >= 6 { vx = (rand.Float64()-0.5)*speed; vy = (rand.Float64()-0.5)*speed }
-		g.zones = append(g.zones, Zone{x: float64(rand.Intn(g.screenWidth-100)+50), y: float64(rand.Intn(g.screenHeight-200)+100), vx: vx, vy: vy, power: 1.6 + float64(g.level)*0.1, radius: 110.0 - float64(g.level)*5.0})
+		if g.level >= 3 {
+			vx = (rand.Float64() - 0.5) * speed
+			vy = (rand.Float64() - 0.5) * speed
+		}
+		g.zones = append(g.zones, Zone{
+			x: float64(rand.Intn(g.screenWidth-100) + 50),
+			y: float64(rand.Intn(g.screenHeight-200) + 100),
+			vx: vx, vy: vy,
+			power:  1.6 + float64(g.level)*0.1,
+			radius: radius,
+		})
 	}
-	numNeg := 1 + g.level/2
-	if numNeg > 5 { numNeg = 5 }
+	// Start with 2 interference zones (was 1), cap at 6
+	numNeg := 2 + g.level/2
+	if numNeg > 6 {
+		numNeg = 6
+	}
 	for i := 0; i < numNeg; i++ {
-		g.zones = append(g.zones, Zone{x: float64(rand.Intn(g.screenWidth-100)+50), y: float64(rand.Intn(g.screenHeight-200)+100), vx: (rand.Float64()-0.5)*(speed+1.5), vy: (rand.Float64()-0.5)*(speed+1.5), power: -4.0, radius: 80})
+		g.zones = append(g.zones, Zone{
+			x:      float64(rand.Intn(g.screenWidth-100) + 50),
+			y:      float64(rand.Intn(g.screenHeight-200) + 100),
+			vx:     (rand.Float64() - 0.5) * (speed + 1.5),
+			vy:     (rand.Float64() - 0.5) * (speed + 1.5),
+			power:  -5.0,
+			radius: 80,
+		})
 	}
 	g.loadScores()
 }
 
+func (g *Game) getPlayerName() string {
+	stored := js.Global().Get("localStorage").Call("getItem", "cyber_player_name").String()
+	if stored != "null" && stored != "" {
+		return stored
+	}
+	result := js.Global().Call("prompt", "ENTER YOUR NAME:", "PLAYER")
+	name := "PLAYER"
+	if !result.IsNull() && !result.IsUndefined() {
+		n := strings.TrimSpace(result.String())
+		if n != "" {
+			name = n
+		}
+	}
+	if len(name) > 8 {
+		name = name[:8]
+	}
+	name = strings.ToUpper(name)
+	js.Global().Get("localStorage").Call("setItem", "cyber_player_name", name)
+	return name
+}
+
 func (g *Game) loadScores() {
 	raw := js.Global().Get("localStorage").Call("getItem", "cyber_scores").String()
-	var scs []int
-	if raw != "null" && raw != "" { for _, s := range strings.Split(raw, ",") { if val, err := strconv.Atoi(s); err == nil { scs = append(scs, val) } } }
-	g.scores = scs
+	var entries []ScoreEntry
+	if raw != "null" && raw != "" {
+		for _, s := range strings.Split(raw, ",") {
+			parts := strings.SplitN(s, "|", 2)
+			if len(parts) == 2 {
+				val, err := strconv.Atoi(parts[1])
+				if err == nil {
+					entries = append(entries, ScoreEntry{name: parts[0], level: val})
+				}
+			} else {
+				// backward compat: old format without name
+				val, err := strconv.Atoi(s)
+				if err == nil {
+					entries = append(entries, ScoreEntry{name: "PLAYER", level: val})
+				}
+			}
+		}
+	}
+	g.scores = entries
 }
 
 func (g *Game) saveScore() {
-	g.loadScores(); g.scores = append(g.scores, g.level+1); sort.Sort(sort.Reverse(sort.IntSlice(g.scores)))
-	if len(g.scores) > 5 { g.scores = g.scores[:5] }
-	var strScores []string
-	for _, s := range g.scores { strScores = append(strScores, strconv.Itoa(s)) }
-	js.Global().Get("localStorage").Call("setItem", "cyber_scores", strings.Join(strScores, ","))
+	if g.playerName == "" {
+		g.playerName = g.getPlayerName()
+	}
+	g.loadScores()
+	g.scores = append(g.scores, ScoreEntry{name: g.playerName, level: g.level + 1})
+	sort.Slice(g.scores, func(i, j int) bool { return g.scores[i].level > g.scores[j].level })
+	if len(g.scores) > 5 {
+		g.scores = g.scores[:5]
+	}
+	var parts []string
+	for _, e := range g.scores {
+		parts = append(parts, e.name+"|"+strconv.Itoa(e.level))
+	}
+	js.Global().Get("localStorage").Call("setItem", "cyber_scores", strings.Join(parts, ","))
 }
 
 func (g *Game) spawnParticles(x, y float64, n int) {
-	for i := 0; i < n; i++ { g.particles = append(g.particles, &Particle{x: x, y: y, vx: (rand.Float64()-0.5)*5, vy: (rand.Float64()-0.5)*5, life: 1.0}) }
+	for i := 0; i < n; i++ {
+		g.particles = append(g.particles, &Particle{
+			x: x, y: y,
+			vx: (rand.Float64() - 0.5) * 5,
+			vy: (rand.Float64() - 0.5) * 5,
+			life: 1.0,
+		})
+	}
 }
 
 func (g *Game) updateParticles() {
-	for i := len(g.particles)-1; i >= 0; i-- { p := g.particles[i]; p.x += p.vx; p.y += p.vy; p.life -= 0.04; if p.life <= 0 { g.particles = append(g.particles[:i], g.particles[i+1:]...) } }
+	for i := len(g.particles) - 1; i >= 0; i-- {
+		p := g.particles[i]
+		p.x += p.vx
+		p.y += p.vy
+		p.life -= 0.04
+		if p.life <= 0 {
+			g.particles = append(g.particles[:i], g.particles[i+1:]...)
+		}
+	}
 }
 
 // --- Deep Organic ASMR Engine ---
 type asmrEngine struct {
-	game      *Game
-	lastBrown float64 
-	lpFilterL, lpFilterR float64 
-	breath    float64
+	game                 *Game
+	lastBrown            float64
+	lpFilterL, lpFilterR float64
+	breath               float64
 }
 
 func (a *asmrEngine) Read(p []byte) (int, error) {
 	for i := 0; i < len(p)/4; i++ {
-		// Generate constant sound (volume is hardware-controlled in Update)
-		white := (rand.Float64()*2 - 1)
-		
-		// 1. Brownian Noise (Deep Ocean Texture)
+		white := rand.Float64()*2 - 1
 		a.lastBrown = (a.lastBrown + (0.01 * white)) / 1.002
 		base := a.lastBrown * 0.4
-		
-		// 2. Soft Breath Modulation
 		a.breath += 0.0004
 		breathMod := (math.Sin(a.breath) + 1.0) / 2.0
 		whisper := white * 0.15 * breathMod
-		
-		// 3. Binaural Panning (Based on X finger position)
 		pan := a.game.fingerX / float64(a.game.screenWidth)
-		if pan < 0 { pan = 0 }; if pan > 1 { pan = 1 }
-		
+		if pan < 0 {
+			pan = 0
+		}
+		if pan > 1 {
+			pan = 1
+		}
 		raw := base + whisper
 		a.lpFilterL = a.lpFilterL + 0.05*(raw-a.lpFilterL)
 		a.lpFilterR = a.lpFilterR + 0.05*(raw-a.lpFilterR)
-		
 		sl := int16(a.lpFilterL * (1.0 - pan) * 32767)
 		sr := int16(a.lpFilterR * pan * 32767)
-		
 		p[4*i], p[4*i+1], p[4*i+2], p[4*i+3] = byte(sl), byte(sl>>8), byte(sr), byte(sr>>8)
 	}
 	return len(p), nil
@@ -302,7 +516,11 @@ func (a *asmrEngine) Read(p []byte) (int, error) {
 
 func (g *Game) Draw(screen *ebiten.Image) {
 	w, h := screen.Bounds().Dx(), screen.Bounds().Dy()
-	if g.screenWidth == 0 { g.screenWidth, g.screenHeight = w, h; g.initZones() }
+	if g.screenWidth == 0 {
+		g.screenWidth, g.screenHeight = w, h
+		g.timeLeft = levelDuration(0)
+		g.initZones()
+	}
 
 	if g.shader != nil {
 		op := &ebiten.DrawRectShaderOptions{}
@@ -310,26 +528,88 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		ids := ebiten.AppendTouchIDs(nil)
 		if len(ids) > 0 {
 			tx, ty := ebiten.TouchPosition(ids[0])
-			for _, z := range g.zones { if math.Sqrt(math.Pow(float64(tx)-z.x, 2) + math.Pow(float64(ty)-z.y, 2)) < z.radius { zoneType = z.power; break } }
+			for _, z := range g.zones {
+				if math.Sqrt(math.Pow(float64(tx)-z.x, 2)+math.Pow(float64(ty)-z.y, 2)) < z.radius {
+					zoneType = z.power
+					break
+				}
+			}
 		}
-		op.Uniforms = map[string]interface{}{"Time": float32(g.time), "Cursor": []float32{float32(g.syncLevel), 0}, "WinTime": float32(g.winTime), "ZoneType": float32(zoneType)}
+		op.Uniforms = map[string]interface{}{
+			"Time":     float32(g.time),
+			"Cursor":   []float32{float32(g.syncLevel), 0},
+			"WinTime":  float32(g.winTime),
+			"ZoneType": float32(zoneType),
+		}
 		screen.DrawRectShader(w, h, g.shader, op)
 	}
 
-	for _, p := range g.particles { vector.DrawFilledCircle(screen, float32(p.x), float32(p.y), 2*float32(p.life), color.RGBA{255, 255, 255, 180}, true) }
+	for _, p := range g.particles {
+		vector.DrawFilledCircle(screen, float32(p.x), float32(p.y), 2*float32(p.life), color.RGBA{255, 255, 255, 180}, true)
+	}
 
 	dict := translations[g.lang]
 	ebitenutil.DebugPrintAt(screen, fmt.Sprintf(">> %s: %d", dict["lvl"], g.level+1), 20, 75)
+	if g.comboCount > 5 && !g.win && !g.showLeaderboard && !g.gameOver {
+		comboMul := 1.0 + float64(g.comboCount)/60.0
+		ebitenutil.DebugPrintAt(screen, fmt.Sprintf("%s %.1fx", dict["combo"], comboMul), 20, 95)
+	}
 
-	if g.win || g.showLeaderboard {
-		// Leaderboard / Win Overlay
-		vector.DrawFilledRect(screen, 40, float32(h/2-100), float32(w-80), 220, color.RGBA{0, 0, 0, 220}, true)
-		title := dict["best"]; if g.win { title = dict["win"] }
+	if g.gameOver || g.win || g.showLeaderboard {
+		boxH := float32(240)
+		if g.gameOver {
+			boxH = 280
+		}
+		vector.DrawFilledRect(screen, 40, float32(h/2-100), float32(w-80), boxH, color.RGBA{0, 0, 0, 220}, true)
+
+		title := dict["best"]
+		if g.win {
+			title = dict["win"]
+		}
+		if g.gameOver {
+			title = dict["over"]
+		}
 		ebitenutil.DebugPrintAt(screen, title, w/2-60, h/2-80)
-		for i, s := range g.scores { ebitenutil.DebugPrintAt(screen, fmt.Sprintf("%d. %s %d", i+1, dict["lvl"], s), w/2-50, h/2-40+i*20) }
+
+		for i, s := range g.scores {
+			ebitenutil.DebugPrintAt(screen,
+				fmt.Sprintf("%d. %-8s %s %d", i+1, s.name, dict["lvl"], s.level),
+				w/2-70, h/2-40+i*20)
+		}
+
+		if (g.win || g.gameOver) && g.levelStreak > 0 {
+			ebitenutil.DebugPrintAt(screen, fmt.Sprintf("%s: %d", dict["streak"], g.levelStreak), w/2-40, h/2+65)
+		}
+		if g.gameOver {
+			ebitenutil.DebugPrintAt(screen, ">> TAP TO RETRY <<", w/2-72, h/2+90)
+		}
 	} else {
-		barW := float32(w-60); vector.DrawFilledRect(screen, 30, float32(h-40), barW, 2, color.RGBA{40, 40, 40, 150}, true)
-		vector.DrawFilledRect(screen, 30, float32(h-40), barW * float32(g.syncLevel), 2, color.RGBA{255, 255, 255, 220}, true)
+		barW := float32(w - 60)
+		barY := float32(h - 40)
+		vector.DrawFilledRect(screen, 30, barY, barW, 6, color.RGBA{40, 40, 40, 150}, true)
+		vector.DrawFilledRect(screen, 30, barY, barW*float32(g.syncLevel), 6, color.RGBA{255, 255, 255, 220}, true)
+		// Milestone tick marks at 25%, 50%, 75%
+		for _, t := range []float32{0.25, 0.50, 0.75} {
+			mx := float32(30) + barW*t
+			vector.DrawFilledRect(screen, mx-1, barY-2, 2, 10, color.RGBA{0, 200, 255, 180}, true)
+		}
+
+		// Timer bar — green → orange → red as time runs out
+		timerFrac := float32(g.timeLeft) / float32(levelDuration(g.level))
+		timerCol := color.RGBA{0, 200, 100, 200}
+		if g.timeLeft < 5.0 {
+			timerCol = color.RGBA{255, 50, 50, 220}
+		} else if g.timeLeft < 10.0 {
+			timerCol = color.RGBA{255, 180, 0, 200}
+		}
+		vector.DrawFilledRect(screen, 0, 62, float32(w)*timerFrac, 4, timerCol, true)
+	}
+
+	// Milestone popup overlay
+	if g.milestoneTime > 0 && !g.win && !g.gameOver {
+		alpha := float64(g.milestoneTime) / 90.0
+		vector.DrawFilledRect(screen, 0, 0, float32(w), float32(h), color.RGBA{0, 200, 255, uint8(alpha * 35)}, true)
+		ebitenutil.DebugPrintAt(screen, g.milestoneMsg, w/2-35, h/2-10)
 	}
 
 	// HEADER BUTTONS
@@ -351,8 +631,12 @@ func (g *Game) Layout(w, h int) (int, int) { return w, h }
 
 func main() {
 	s, err := ebiten.NewShader(shaderSource)
-	if err != nil { panic(err) }
+	if err != nil {
+		panic(err)
+	}
 	game := &Game{lang: "es", shader: s}
 	ebiten.SetWindowSize(400, 800)
-	if err := ebiten.RunGame(game); err != nil { panic(err) }
+	if err := ebiten.RunGame(game); err != nil {
+		panic(err)
+	}
 }
