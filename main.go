@@ -4,11 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"image/color"
+	_ "image/jpeg"
 	"math"
 	"math/rand"
 	"strings"
 	"syscall/js"
-	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/audio"
@@ -113,7 +113,6 @@ type Game struct {
 	lang             string
 	level            int
 	syncLevel        float64
-	motionVal        float64
 	win              bool
 	winTime          float64
 	time             float64
@@ -137,11 +136,16 @@ type Game struct {
 	milestones       [3]bool
 	milestoneTime    float64
 	milestoneMsg     string
+	milestoneColor   color.RGBA
 	levelStreak      int
 	timeLeft         float64
 	gameOver         bool
 	playerName       string
 	gameStarted      bool
+	bgImage          *ebiten.Image
+	introImage       *ebiten.Image
+	introAudio      js.Value
+	introAudioReady bool
 }
 
 func levelDuration(level int) float64 {
@@ -158,6 +162,14 @@ func (g *Game) Update() error {
 	g.isTouching = len(touchIDs) > 0 || ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft)
 	if !g.audioStarted && g.isTouching {
 		g.initAudio()
+	}
+	// Pick up intro audio as soon as the HTML click handler has created it
+	if !g.introAudioReady {
+		intro := js.Global().Get("cyberIntroAudio")
+		if !intro.IsUndefined() && !intro.IsNull() {
+			g.introAudio = intro
+			g.introAudioReady = true
+		}
 	}
 
 	if g.screenWidth == 0 {
@@ -228,7 +240,7 @@ func (g *Game) Update() error {
 	touchingPlay := g.isTouching && g.fingerY >= uiBarHeight
 	if g.player != nil {
 		vol := 0.0
-		if touchingPlay || g.win {
+		if g.gameStarted && (touchingPlay || g.win) {
 			vol = g.syncLevel
 			if g.win {
 				vol = 1.0
@@ -238,6 +250,18 @@ func (g *Game) Update() error {
 			}
 		}
 		g.player.SetVolume(vol)
+	}
+	if g.introAudioReady {
+		v := g.introAudio.Get("volume").Float()
+		if !g.gameStarted {
+			if v < 0.7 {
+				g.introAudio.Set("volume", math.Min(v+0.004, 0.7))
+			}
+		} else {
+			if v > 0.12 {
+				g.introAudio.Set("volume", math.Max(v-0.006, 0.12))
+			}
+		}
 	}
 
 	if g.gameOver {
@@ -325,7 +349,7 @@ func (g *Game) Update() error {
 		g.syncLevel -= drain
 	}
 
-	g.syncLevel += friction + (g.motionVal * 0.005)
+	g.syncLevel += friction
 	if g.syncLevel < 0 {
 		g.syncLevel = 0
 	}
@@ -339,11 +363,17 @@ func (g *Game) Update() error {
 	}
 	thresholds := [3]float64{0.25, 0.50, 0.75}
 	msgs := [3]string{"25% SYNC!", "50% SYNC!", "75% SYNC!"}
+	colors := [3]color.RGBA{
+		{0, 220, 255, 255},   // 25%: cyan
+		{180, 0, 255, 255},   // 50%: purple
+		{255, 0, 180, 255},   // 75%: magenta
+	}
 	for i, t := range thresholds {
 		if !g.milestones[i] && g.syncLevel >= t {
 			g.milestones[i] = true
 			g.milestoneTime = 90
 			g.milestoneMsg = msgs[i]
+			g.milestoneColor = colors[i]
 			js.Global().Get("window").Get("navigator").Call("vibrate", 50)
 		}
 	}
@@ -386,7 +416,15 @@ func (g *Game) initAudio() {
 		if err == nil {
 			g.player.SetVolume(0)
 			g.player.Play()
-			g.audioStarted = true
+		}
+		g.audioStarted = true
+
+		// Intro music via native HTML Audio — reliable relative URL resolution and MP3 support
+		// Pick up the Audio element created by the HTML click handler (user-gesture context)
+		intro := js.Global().Get("cyberIntroAudio")
+		if !intro.IsUndefined() && !intro.IsNull() {
+			g.introAudio = intro
+			g.introAudioReady = true
 		}
 	}
 }
@@ -415,7 +453,6 @@ func (g *Game) resetGame() {
 }
 
 func (g *Game) initZones() {
-	rand.Seed(time.Now().UnixNano())
 	g.zones = nil
 	g.milestones = [3]bool{}
 	speed := 1.0 + float64(g.level)*0.2
@@ -487,7 +524,7 @@ func (g *Game) getPlayerName() string {
 }
 
 func (g *Game) loadScores() {
-	resp := httpGetJSON("/leaderboard")
+	resp := httpGetJSON(js.Global().Get("gameBaseURL").String()+"leaderboard.php")
 	if resp == "" {
 		return
 	}
@@ -510,7 +547,7 @@ func (g *Game) saveScore() {
 	}
 	payload := serverScore{Name: g.playerName, Level: g.level + 1}
 	data, _ := json.Marshal(payload)
-	resp := httpPostJSON("/leaderboard", string(data))
+	resp := httpPostJSON(js.Global().Get("gameBaseURL").String()+"leaderboard.php", string(data))
 	if resp == "" {
 		return
 	}
@@ -690,6 +727,20 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		g.initZones()
 	}
 
+	if g.bgImage != nil {
+		bw := float64(g.bgImage.Bounds().Dx())
+		bh := float64(g.bgImage.Bounds().Dy())
+		sx, sy := float64(w)/bw, float64(h)/bh
+		s := sx
+		if sy > sx {
+			s = sy
+		}
+		op := &ebiten.DrawImageOptions{}
+		op.GeoM.Scale(s, s)
+		op.GeoM.Translate((float64(w)-bw*s)/2, (float64(h)-bh*s)/2)
+		screen.DrawImage(g.bgImage, op)
+	}
+
 	if g.shader != nil {
 		op := &ebiten.DrawRectShaderOptions{}
 		zoneType := 0.0
@@ -774,23 +825,85 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	}
 
 	if g.milestoneTime > 0 && !g.win && !g.gameOver {
-		alpha := float64(g.milestoneTime) / 90.0
-		vector.DrawFilledRect(screen, 0, 0, float32(w), float32(h), color.RGBA{0, 200, 255, uint8(alpha * 35)}, true)
-		ebitenutil.DebugPrintAt(screen, g.milestoneMsg, w/2-35, h/2-10)
+		t := g.milestoneTime / 90.0  // 1→0
+		progress := 1.0 - t          // 0→1
+		cx := float32(w) / 2
+		cy := float32(h) / 2
+		maxR := float32(math.Sqrt(float64(w*w+h*h)) / 2)
+		mc := g.milestoneColor
+
+		// Primary ring: ease-out expansion, fades as it expands
+		r1 := maxR * float32(1.0-math.Pow(1.0-progress, 2))
+		mc.A = uint8(t * 255)
+		vector.StrokeCircle(screen, cx, cy, r1, 4, mc, true)
+
+		// Secondary ring: delayed by 15% of animation
+		if progress > 0.15 {
+			p2 := (progress - 0.15) / 0.85
+			r2 := maxR * float32(1.0-math.Pow(1.0-p2, 2))
+			mc.A = uint8(t * 160)
+			vector.StrokeCircle(screen, cx, cy, r2, 2, mc, true)
+		}
+
+		// Screen-edge flash: only at the start of the animation
+		if t > 0.75 {
+			mc.A = uint8((t - 0.75) / 0.25 * 100)
+			thick := float32(8)
+			vector.DrawFilledRect(screen, 0, 0, float32(w), thick, mc, false)
+			vector.DrawFilledRect(screen, 0, float32(h)-thick, float32(w), thick, mc, false)
+			vector.DrawFilledRect(screen, 0, thick, thick, float32(h)-2*thick, mc, false)
+			vector.DrawFilledRect(screen, float32(w)-thick, thick, thick, float32(h)-2*thick, mc, false)
+		}
+
+		// Text: visible in the middle of the animation
+		if t > 0.15 && t < 0.8 {
+			vector.DrawFilledRect(screen, float32(w/2-52), float32(h/2-18), 104, 22, color.RGBA{0, 0, 0, 160}, false)
+			ebitenutil.DebugPrintAt(screen, g.milestoneMsg, w/2-35, h/2-10)
+		}
 	}
 
 	// Intro screen overlay
 	if !g.gameStarted {
-		vector.DrawFilledRect(screen, 30, float32(h/2-130), float32(w-60), 260, color.RGBA{0, 0, 0, 210}, true)
-		ebitenutil.DebugPrintAt(screen, "CYBER EUPHORIA", w/2-56, h/2-110)
-		if g.playerName != "" {
-			ebitenutil.DebugPrintAt(screen, "PLAYER: "+g.playerName, w/2-52, h/2-80)
-			ebitenutil.DebugPrintAt(screen, ">> TAP TO START <<", w/2-72, h/2-40)
+		if g.introImage != nil {
+			iw := float64(g.introImage.Bounds().Dx())
+			ih := float64(g.introImage.Bounds().Dy())
+			maxW := float64(w) * 0.85
+			maxH := float64(h) * 0.60
+			s := maxW / iw
+			if ih*s > maxH {
+				s = maxH / ih
+			}
+			imgW := iw * s
+			imgH := ih * s
+			ox := (float64(w) - imgW) / 2
+			oy := float64(h) * 0.05
+			iop := &ebiten.DrawImageOptions{}
+			iop.GeoM.Scale(s, s)
+			iop.GeoM.Translate(ox, oy)
+			screen.DrawImage(g.introImage, iop)
+
+			textY := int(oy+imgH) + 15
+			vector.DrawFilledRect(screen, 20, float32(textY-8), float32(w-40), 90, color.RGBA{0, 0, 0, 180}, true)
+			if g.playerName != "" {
+				ebitenutil.DebugPrintAt(screen, "PLAYER: "+g.playerName, w/2-52, textY)
+				ebitenutil.DebugPrintAt(screen, ">> TAP TO START <<", w/2-72, textY+20)
+			} else {
+				ebitenutil.DebugPrintAt(screen, ">> TAP TO ENTER NAME <<", w/2-88, textY)
+			}
+			ebitenutil.DebugPrintAt(screen, "MOVE FINGER IN GLOWING", w/2-88, textY+45)
+			ebitenutil.DebugPrintAt(screen, " ZONES TO FILL THE BAR", w/2-88, textY+65)
 		} else {
-			ebitenutil.DebugPrintAt(screen, ">> TAP TO ENTER NAME <<", w/2-88, h/2-80)
+			vector.DrawFilledRect(screen, 30, float32(h/2-130), float32(w-60), 260, color.RGBA{0, 0, 0, 210}, true)
+			ebitenutil.DebugPrintAt(screen, "CYBER EUPHORIA", w/2-56, h/2-110)
+			if g.playerName != "" {
+				ebitenutil.DebugPrintAt(screen, "PLAYER: "+g.playerName, w/2-52, h/2-80)
+				ebitenutil.DebugPrintAt(screen, ">> TAP TO START <<", w/2-72, h/2-40)
+			} else {
+				ebitenutil.DebugPrintAt(screen, ">> TAP TO ENTER NAME <<", w/2-88, h/2-80)
+			}
+			ebitenutil.DebugPrintAt(screen, "MOVE FINGER IN GLOWING", w/2-88, h/2-10)
+			ebitenutil.DebugPrintAt(screen, " ZONES TO FILL THE BAR", w/2-88, h/2+10)
 		}
-		ebitenutil.DebugPrintAt(screen, "MOVE FINGER IN GLOWING", w/2-88, h/2-10)
-		ebitenutil.DebugPrintAt(screen, " ZONES TO FILL THE BAR", w/2-88, h/2+10)
 	}
 
 	// HEADER BUTTONS
@@ -818,7 +931,9 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	game := &Game{lang: "en", shader: s}
+	bg, _ := ebitenutil.NewImageFromURL("cyber-background.jpg")
+	intro, _ := ebitenutil.NewImageFromURL("cyber-euphoria.jpg")
+	game := &Game{lang: "en", shader: s, bgImage: bg, introImage: intro}
 	ebiten.SetWindowSize(400, 800)
 	if err := ebiten.RunGame(game); err != nil {
 		panic(err)

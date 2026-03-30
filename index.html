@@ -57,13 +57,21 @@
     </div>
 
     <script>
+        // Resolve base path once so all relative URLs work regardless of subdirectory depth
+        window.gameBaseURL = new URL('.', window.location.href).href;
+
         const go = new Go();
-        // Añadimos un timestamp para evitar que el teléfono use la versión vieja guardada en caché
         const wasmUrl = "main.wasm?v=" + new Date().getTime();
-        
+
         WebAssembly.instantiateStreaming(fetch(wasmUrl), go.importObject).then((result) => {
             const inst = result.instance;
             document.getElementById('start-btn').addEventListener('click', async () => {
+                // Start intro music inside the user-gesture handler so autoplay is allowed
+                window.cyberIntroAudio = new Audio(window.gameBaseURL + 'cyber-euphoria.mp3');
+                window.cyberIntroAudio.loop = true;
+                window.cyberIntroAudio.volume = 0;
+                window.cyberIntroAudio.play().catch(function(){});
+
                 if (typeof DeviceMotionEvent.requestPermission === 'function') {
                     try {
                         const permission = await DeviceMotionEvent.requestPermission();
