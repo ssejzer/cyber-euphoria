@@ -43,6 +43,11 @@ type Particle struct {
 	life          float64
 }
 
+type TrailPoint struct {
+	x, y float64
+	life float64
+}
+
 type ScoreEntry struct {
 	name  string
 	level int
@@ -146,6 +151,13 @@ type Game struct {
 	introImage       *ebiten.Image
 	introAudio      js.Value
 	introAudioReady bool
+	trail           []TrailPoint
+	zoneFlicker     float64
+	comboPopTime    float64
+	lastComboCount  int
+	personalBest    int
+	pbLoaded        bool
+	newBestLevel    bool
 }
 
 func levelDuration(level int) float64 {
@@ -258,8 +270,8 @@ func (g *Game) Update() error {
 				g.introAudio.Set("volume", math.Min(v+0.004, 0.7))
 			}
 		} else {
-			if v > 0.12 {
-				g.introAudio.Set("volume", math.Max(v-0.006, 0.12))
+			if v > 0.06 {
+				g.introAudio.Set("volume", math.Max(v-0.006, 0.06))
 			}
 		}
 	}
@@ -392,6 +404,36 @@ func (g *Game) Update() error {
 			z.vy *= -1
 		}
 	}
+	// Finger trail: record positions while touching play area
+	if g.isTouching && g.fingerY >= uiBarHeight {
+		g.trail = append(g.trail, TrailPoint{x: g.fingerX, y: g.fingerY, life: 1.0})
+		if len(g.trail) > 30 {
+			g.trail = g.trail[1:]
+		}
+	}
+	for i := range g.trail {
+		g.trail[i].life -= 0.06
+	}
+	live := g.trail[:0]
+	for _, tp := range g.trail {
+		if tp.life > 0 {
+			live = append(live, tp)
+		}
+	}
+	g.trail = live
+
+	// Zone flicker animation clock
+	g.zoneFlicker += 1.0 / 60.0
+
+	// Combo pop: trigger near-finger display when combo builds
+	if g.comboCount > g.lastComboCount+4 && g.comboCount > 0 {
+		g.comboPopTime = 45
+	}
+	g.lastComboCount = g.comboCount
+	if g.comboPopTime > 0 {
+		g.comboPopTime--
+	}
+
 	g.updateParticles()
 	return nil
 }
@@ -449,6 +491,7 @@ func (g *Game) resetGame() {
 	g.levelStreak = 0
 	g.comboCount = 0
 	g.timeLeft = levelDuration(0)
+	g.newBestLevel = false
 	g.initZones()
 }
 
@@ -488,6 +531,21 @@ func (g *Game) initZones() {
 			radius: 80,
 		})
 	}
+	// Load personal best from localStorage once per session
+	if !g.pbLoaded {
+		g.pbLoaded = true
+		val := js.Global().Get("localStorage").Call("getItem", "cyber_best_level")
+		if !val.IsNull() && !val.IsUndefined() {
+			if stored := val.String(); stored != "" {
+				pb := 0
+				fmt.Sscanf(stored, "%d", &pb)
+				if pb > 0 {
+					g.personalBest = pb
+				}
+			}
+		}
+	}
+
 	// Pre-load stored name so intro screen can show it immediately
 	if g.playerName == "" {
 		val := js.Global().Get("localStorage").Call("getItem", "cyber_player_name")
@@ -545,6 +603,12 @@ func (g *Game) saveScore() {
 	if g.playerName == "" {
 		g.playerName = g.getPlayerName()
 	}
+	// Update personal best in memory and localStorage
+	if g.level+1 > g.personalBest {
+		g.personalBest = g.level + 1
+		g.newBestLevel = true
+		js.Global().Get("localStorage").Call("setItem", "cyber_best_level", fmt.Sprintf("%d", g.personalBest))
+	}
 	payload := serverScore{Name: g.playerName, Level: g.level + 1}
 	data, _ := json.Marshal(payload)
 	resp := httpPostJSON(js.Global().Get("gameBaseURL").String()+"leaderboard.php", string(data))
@@ -596,10 +660,13 @@ type voiceEngine struct {
 	phase       float64
 	vibratoPhase float64
 	breathPhase  float64
-	breathAcc    float64
-	lpState     float64 // one-pole low-pass filter state
-	wasWin      bool // detects win transition to reset state
-	wasPlaying  bool // detects touch-start to sync breath phase
+	breathAcc  float64
+	lpState    float64 // one-pole low-pass filter state
+	beatPhase  float64
+	dronePhase float64
+	touchFlash float64
+	wasWin     bool // detects win transition to reset state
+	wasPlaying bool // detects touch-start to sync breath phase
 }
 
 func (m *voiceEngine) Read(p []byte) (int, error) {
@@ -613,6 +680,17 @@ func (m *voiceEngine) Read(p []byte) (int, error) {
 		if isPlaying && !m.wasPlaying {
 			m.breathPhase = math.Pi / 2
 		}
+
+		// Touch-start burst: brief noise click on first contact (ASMR trigger)
+		var touchBurst float64
+		if isPlaying && !m.wasPlaying {
+			m.touchFlash = 882.0 // ~20 ms at 44100 Hz
+		}
+		if m.touchFlash > 0 {
+			m.touchFlash -= 1.0
+			touchBurst = (rand.Float64()*2-1) * (m.touchFlash / 882.0) * 0.10
+		}
+
 		m.wasPlaying = isPlaying
 
 		// Reset and re-sync on win start — clear break from gameplay moan
@@ -642,7 +720,7 @@ func (m *voiceEngine) Read(p []byte) (int, error) {
 		} else {
 			// Gameplay: female voice range, rises with sync
 			baseFreq = 180.0 + sync*180.0   // 180 → 360 Hz (female range)
-			breathRate = 0.7 + sync*1.1     // 0.7 → 1.8 Hz
+			breathRate = 0.3 + sync*1.5     // 0.3 → 1.8 Hz (slow start for ASMR feel)
 			vibratoAmp = 0.012 + sync*0.018 // expressive throughout
 		}
 
@@ -692,7 +770,7 @@ func (m *voiceEngine) Read(p []byte) (int, error) {
 
 		// Airy breath noise — reduced to avoid buzziness
 		m.breathAcc = (m.breathAcc + (rand.Float64()*2-1)*0.04) * 0.97
-		sample += m.breathAcc * 0.02 * breathEnv
+		sample += m.breathAcc*0.02*breathEnv + touchBurst
 
 		// Soft clip — reduced drive to avoid adding distortion harmonics
 		sample = math.Tanh(sample * 0.75)
@@ -704,7 +782,21 @@ func (m *voiceEngine) Read(p []byte) (int, error) {
 		m.lpState += alpha * (sample - m.lpState)
 		sample = m.lpState
 
-		// Binaural pan
+		// Binaural beat: right channel at freq+10 Hz for 10 Hz alpha entrainment
+		m.beatPhase += 2 * math.Pi * (freq + 10.0) / float64(sampleRate)
+		if m.beatPhase > 2*math.Pi {
+			m.beatPhase -= 2 * math.Pi
+		}
+		beatTone := math.Sin(m.beatPhase) * 0.06 * breathEnv
+
+		// Ambient drone: quiet 60 Hz hum always present (meditative foundation)
+		m.dronePhase += 2 * math.Pi * 60.0 / float64(sampleRate)
+		if m.dronePhase > 2*math.Pi {
+			m.dronePhase -= 2 * math.Pi
+		}
+		drone := math.Sin(m.dronePhase) * 0.022
+
+		// Binaural spatial pan + beat divergence between channels
 		pan := 0.5
 		if m.game.screenWidth > 0 {
 			pan = m.game.fingerX / float64(m.game.screenWidth)
@@ -715,8 +807,10 @@ func (m *voiceEngine) Read(p []byte) (int, error) {
 				pan = 1
 			}
 		}
-		sl := int16(sample * (1.0 - pan*0.5) * 32767)
-		sr := int16(sample * (0.5 + pan*0.5) * 32767)
+		lSig := (sample + drone) * (1.0 - pan*0.5)
+		rSig := (sample + drone + beatTone) * (0.5 + pan*0.5)
+		sl := int16(lSig * 32767)
+		sr := int16(rSig * 32767)
 		p[4*i] = byte(sl)
 		p[4*i+1] = byte(sl >> 8)
 		p[4*i+2] = byte(sr)
@@ -769,6 +863,19 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		screen.DrawRectShader(w, h, g.shader, op)
 	}
 
+	// Finger trail — drawn before particles so particles appear on top
+	if g.gameStarted {
+		for _, tp := range g.trail {
+			tc := color.RGBA{0, uint8(200 * tp.life), uint8(255 * tp.life), uint8(140 * tp.life)}
+			if g.currentZonePower < 0 {
+				tc = color.RGBA{uint8(255 * tp.life), uint8(30 * tp.life), 0, uint8(120 * tp.life)}
+			} else if g.currentZonePower > 0 {
+				tc = color.RGBA{uint8(60 * tp.life), uint8(255 * tp.life), uint8(180 * tp.life), uint8(160 * tp.life)}
+			}
+			vector.DrawFilledCircle(screen, float32(tp.x), float32(tp.y), float32(4*tp.life)+1, tc, true)
+		}
+	}
+
 	for _, p := range g.particles {
 		vector.DrawFilledCircle(screen, float32(p.x), float32(p.y), 2*float32(p.life), color.RGBA{255, 255, 255, 180}, true)
 	}
@@ -781,12 +888,22 @@ func (g *Game) Draw(screen *ebiten.Image) {
 			comboMul := 1.0 + float64(g.comboCount)/60.0
 			ebitenutil.DebugPrintAt(screen, fmt.Sprintf("%s %.1fx", dict["combo"], comboMul), 20, 95)
 		}
+		// Combo pop: float multiplier near finger when combo builds
+		if g.comboPopTime > 20 && g.isTouching && !g.win && !g.gameOver {
+			comboMul := 1.0 + float64(g.comboCount)/60.0
+			fx, fy := int(g.fingerX)-12, int(g.fingerY)-50
+			if fy < uiBarHeight+10 {
+				fy = uiBarHeight + 10
+			}
+			vector.DrawFilledRect(screen, float32(fx-4), float32(fy-4), 52, 16, color.RGBA{0, 0, 0, 160}, false)
+			ebitenutil.DebugPrintAt(screen, fmt.Sprintf("%.1fx", comboMul), fx, fy)
+		}
 	}
 
 	if g.gameOver || g.win || (g.showLeaderboard && g.gameStarted) {
 		boxH := float32(240)
 		if g.gameOver {
-			boxH = 280
+			boxH = 310
 		}
 		vector.DrawFilledRect(screen, 40, float32(h/2-100), float32(w-80), boxH, color.RGBA{0, 0, 0, 220}, true)
 
@@ -810,6 +927,11 @@ func (g *Game) Draw(screen *ebiten.Image) {
 		}
 		if g.gameOver {
 			ebitenutil.DebugPrintAt(screen, ">> TAP TO RETRY <<", w/2-72, h/2+90)
+			if g.newBestLevel {
+				ebitenutil.DebugPrintAt(screen, fmt.Sprintf("** NEW BEST: LVL %d! **", g.personalBest), w/2-80, h/2+115)
+			} else if g.personalBest > 0 {
+				ebitenutil.DebugPrintAt(screen, fmt.Sprintf("BEST: LVL %d  NOW: LVL %d", g.personalBest, g.level+1), w/2-76, h/2+115)
+			}
 		}
 	} else if g.gameStarted {
 		barW := float32(w - 60)
@@ -828,6 +950,10 @@ func (g *Game) Draw(screen *ebiten.Image) {
 			timerCol = color.RGBA{255, 180, 0, 200}
 		}
 		vector.DrawFilledRect(screen, 0, 62, float32(w)*timerFrac, 4, timerCol, true)
+		// "Almost" encouragement when time is nearly up but sync is high
+		if g.timeLeft <= 5.0 && g.syncLevel >= 0.70 {
+			ebitenutil.DebugPrintAt(screen, "SO CLOSE! KEEP GOING!", w/2-84, h-65)
+		}
 	}
 
 	if g.milestoneTime > 0 && !g.win && !g.gameOver {
