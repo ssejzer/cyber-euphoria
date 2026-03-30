@@ -26,6 +26,7 @@ venv
 .agents/
 skills-lock.json
 .claude/skills/
+CLAUDE.md
 
 # Binaries for programs and plugins
 *.exe
