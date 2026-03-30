@@ -1,0 +1,86 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+.next/
+out/
+build/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+!.env.example
+!docker/.env.example
+venv
+
+# IDE / AI agent tools
+.vscode/
+.idea/
+*.swp
+*.swo
+.windsurf/
+.agent/
+.agents/
+skills-lock.json
+.claude/skills/
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Testing
+coverage/
+
+# Turbo
+.turbo/
+
+# Prisma
+packages/database/prisma/*.db
+
+# Docker volumes
+docker/volumes/
+
+# MinIO data
+minio-data/
+
+# Temp scan outputs
+tmp/
+temp/
+__pycache__
+
+# Database backups
+backups/
+
+# Large seed data files (use GitHub Release assets instead)
+data/*.sql.gz
